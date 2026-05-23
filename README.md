@@ -49,7 +49,7 @@ The bot runs a single script (`scripts/intraday_trader.py`) that executes three 
 
 ### Phase 1 — Position Management (Fully Mechanical)
 
-Checks every open position using five deterministic price-based rules — **no LLM involved**. Rules are checked in priority order; the first rule that fires closes the position.
+Checks every open position using six deterministic price-based rules — **no LLM involved**. Rules are checked in priority order; the first rule that fires closes the position.
 
 1. **Load open positions** from `data/positions/open_positions.json`
 2. **Batch fetch current prices** from CoinGecko for all held coins
@@ -61,8 +61,9 @@ Checks every open position using five deterministic price-based rules — **no L
    | Stop-loss | Down ≥ `adaptive_stop_pct` from entry | `STOP_LOSS` |
    | Trailing stop | Down ≥ `adaptive_stop_pct` from high-water mark (once in profit) | `TRAILING_STOP` |
    | Take-profit | Gain ≥ `target_pct` | `TAKE_PROFIT` |
-   | Profit protection | Peak gain ≥ 4%, current gain ≤ 50% of peak (e.g. peak +8% → close at +4%) | `PROFIT_PROTECTION` |
-   | Time horizon expired | Held past `time_horizon` | `TIME_EXPIRED` |
+   | Profit protection | Peak gain ≥ 5%, current gain ≤ 35% of peak (e.g. peak +8% → close at +2.8%) | `PROFIT_PROTECTION` |
+   | Mid-horizon stale exit | Past 50% of `time_horizon` with P&L < +0.5% — thesis not materialising | `STALE_POSITION` |
+   | Time horizon expired | Held past full `time_horizon` | `TIME_EXPIRED` |
 
 5. **Execute closes** — closed positions are appended to `data/positions/resolved_trades.jsonl`
 6. **Update open positions** — surviving positions saved back with updated prices and P&L
@@ -98,13 +99,15 @@ Before fetching any data, the bot checks unrealised portfolio P&L:
 
 After fetching the Fear & Greed Index, the bot determines the current **market regime** and adjusts trading parameters. All regimes allow trading across the full 500-coin universe — there are no rank caps.
 
-| Regime | F&G | Min conviction | Max open |
-|--------|-----|:---:|:---:|
-| Extreme Fear | ≤ 20 | 0.68 | 15 |
-| Fear | 21–40 | 0.68 | 18 |
-| Neutral | 41–60 | 0.72 | 20 |
-| Greed | 61–80 | 0.75 | 20 |
-| Extreme Greed | > 80 | blocked | — |
+| Regime | F&G | Min conviction | Max open | L1 coins (BTC/ETH/SOL/TRX) |
+|--------|-----|:---:|:---:|:---:|
+| Extreme Fear | ≤ 20 | 0.68 | 15 | excluded |
+| Fear | 21–40 | 0.68 | 18 | excluded |
+| Neutral | 41–60 | 0.72 | 20 | allowed |
+| Greed | 61–80 | 0.75 | 20 | allowed |
+| Extreme Greed | > 80 | blocked | — | — |
+
+L1 large-caps are excluded in Fear/Extreme Fear because the strategy's edge is in mid/small-cap mean-reversion. Historical data shows 25% win rate on L1 entries in fear regimes.
 
 #### 7-step pipeline
 
@@ -167,7 +170,7 @@ After fetching the Fear & Greed Index, the bot determines the current **market r
    - `coin_id`, `symbol`, `coin_name`
    - `conviction` — 0.0 to 1.0 confidence score
    - `reasoning` and `risks`
-   - `time_horizon` — expected hold period (12h, 1d, 2d, etc. — short horizons preferred)
+   - `time_horizon` — expected hold period. Hard cap: **2d maximum**. Default is 1d for dip bounces, 2d for catalyst plays. (3d/7d holds went 0-for-4 historically.)
    - `target_pct` — typically 5–8% for dip bounces
    - `stop_loss_pct`
 
@@ -232,8 +235,9 @@ Run this **weekly** to keep profiles current. Add to crontab:
 | Vol-adaptive stop-loss | Per-coin: `max(min(daily_vol × 3, 25%), 10%)` — stamped at entry |
 | Trailing stop | Once in profit, close if price falls `adaptive_stop_pct` below high-water mark |
 | Take-profit | Close when gain reaches `target_pct` |
-| Profit protection | Peak gain ≥4%, current gain ≤50% of peak → lock in remaining profit |
-| Time horizon | Close positions held past their intended duration |
+| Profit protection | Peak gain ≥5%, current gain ≤35% of peak (e.g. peak +8% → close at +2.8%) |
+| Mid-horizon stale exit | Past 50% of time horizon with P&L < +0.5% → cut early, thesis not materialising |
+| Time horizon | Close positions held past their full intended duration |
 | Exhaustion hard filter | Reject coins already pumped >12/18/30% in 24h (regime-dependent) |
 | RSI hard filter | Reject dip candidates (down >4%) if RSI >55 (bounce already done) |
 | Dynamic daily loss limit | `max(open_positions × $5 × 25%, $5)` |
