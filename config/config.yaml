@@ -1,0 +1,53 @@
+# Crypto Trading Bot Configuration
+
+# LLM Configuration
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-6                # Phase 2 — trade discovery (quality matters)
+  lite_model: claude-haiku-4-5-20251001   # Phase 3 — post-trade lesson extraction (summarization)
+  api_key: ${ANTHROPIC_API_KEY}
+  max_tokens: 4000
+  temperature: 0.7
+
+# Trading Configuration
+trading:
+  enabled: false  # Paper trading only
+  max_trades_per_run: 5
+  max_open_positions: 20
+  max_position_size_usd: 5  # Flat $5 per trade
+  min_conviction_score: 0.7
+  max_positions_per_sector: 4       # Max open positions in any single sector (L1, DeFi, Meme, etc.)
+  min_profit_pct: 5.0
+
+# Risk Management
+risk:
+  max_daily_loss_pct_of_committed: 0.25  # 25% of committed capital (e.g. $12.50 on $50 committed)
+  max_daily_loss_floor_usd: 5.0          # Minimum daily loss limit (one full position)
+  max_position_percentage: 0.2
+  stop_loss_percentage: 0.20             # 20% stop loss
+  drawdown_warning_pct: -15.0            # Unrealised drawdown % → be more selective
+  drawdown_halt_pct: -25.0               # Unrealised drawdown % → block new trades entirely
+
+# Data Sources (all free)
+data_sources:
+  coingecko:
+    enabled: true
+    top_coins: 500  # Top N coins by market cap to fetch (2 pages of 250 from CoinGecko)
+  news:
+    enabled: true
+    sources:
+      - rss_feeds  # CoinDesk, CoinTelegraph, Decrypt, Bitcoin Magazine
+    max_articles: 60
+  fear_greed:
+    enabled: true
+
+  # Pre-screen settings
+  min_volume_usd: 10000000  # $10M minimum 24h volume — opens mid/small caps for volatile swings
+  max_candidates: 25        # Max coins to send to LLM after pre-screen
+  min_stop_multiple: 1.5    # Reject coins where 20% stop fires within 1.5 daily moves
+
+# Logging
+logging:
+  level: INFO
+  log_to_file: true
+  log_dir: logs
