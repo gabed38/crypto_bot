@@ -4,6 +4,17 @@
 
 A crypto trading bot that uses Claude (Anthropic API) to analyze crypto markets and recommend trades. **Paper trading only** (`trading.enabled: false` in `config/config.yaml`). All trades are written to files, not executed on any exchange.
 
+## Slash commands
+
+```bash
+/analyze-performance        # Last 30 days
+/analyze-performance 7d     # Last 7 days
+/analyze-performance 14d    # Last 14 days
+/analyze-performance 2026-04-01:2026-05-01  # Explicit date range
+```
+
+Reads `resolved_trades.jsonl`, `rejected_YYYYMMDD.jsonl`, `lessons.json`, and `open_positions.json` to produce a structured performance report with win rate, P&L breakdown, exit type analysis, sector performance, rejection patterns, recurring lesson themes, and specific strategy tweak recommendations.
+
 ## Running the bot
 
 ```bash
