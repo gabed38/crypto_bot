@@ -110,6 +110,43 @@ def _parse_horizon_days(horizon_str: str) -> Optional[int]:
     return {"d": value, "w": value * 7, "m": value * 30}[unit]
 
 
+def check_mid_horizon_stale(
+    position: Dict,
+    stale_pnl_threshold: float = 0.5,
+) -> bool:
+    """Return True when a position is past its halfway point with minimal gain.
+
+    Cuts dead-weight positions early rather than letting them ride to TIME_EXPIRED.
+    Only fires when pnl_pct is below stale_pnl_threshold (default +0.5%) — meaning
+    the trade thesis has not materialised at all by the halfway mark.
+
+    Not called when pnl is unavailable (price fetch failed) — stays open in that case.
+    """
+    exec_str = (
+        position.get("execution_date")
+        or position.get("execution_timestamp", "")
+    )
+    if not exec_str:
+        return False
+
+    horizon_days = _parse_horizon_days(position.get("time_horizon", ""))
+    if horizon_days is None:
+        return False
+
+    pnl_pct = position.get("pnl_pct")
+    if pnl_pct is None:
+        return False
+
+    try:
+        opened = datetime.fromisoformat(str(exec_str)[:10])
+        days_held = (datetime.now() - opened).total_seconds() / 86400
+        if days_held >= horizon_days / 2 and pnl_pct < stale_pnl_threshold:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def check_time_horizon_expired(position: Dict) -> bool:
     """Return True if the position has been held at least as long as its time_horizon.
 

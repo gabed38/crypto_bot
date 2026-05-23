@@ -63,6 +63,7 @@ from helpers import (
     load_recent_resolved,
     evaluate_position,
     check_time_horizon_expired,
+    check_mid_horizon_stale,
     save_lessons,
     load_recent_lessons,
     POSITIONS_FILE,
@@ -154,6 +155,7 @@ def run_phase1_position_management(
     trailing_stop_ids: set = set()
     take_profit_ids: set = set()
     profit_protect_ids: set = set()
+    stale_ids: set = set()
     expired_ids: set = set()
 
     for r in price_ok:
@@ -173,6 +175,12 @@ def run_phase1_position_management(
             logger.info(f"Take-profit: {symbol} @ {pnl_pct:+.1f}% (target {target:.1f}%)")
         elif risk_manager.check_profit_protection(r, price):
             profit_protect_ids.add(cid)
+        elif check_mid_horizon_stale(r):
+            stale_ids.add(cid)
+            logger.info(
+                f"Mid-horizon stale: {symbol} "
+                f"(horizon: {r.get('time_horizon', '?')}, P&L: {pnl_pct:+.1f}% — cutting early)"
+            )
         elif check_time_horizon_expired(r):
             expired_ids.add(cid)
             logger.info(
@@ -194,6 +202,9 @@ def run_phase1_position_management(
     if profit_protect_ids:
         syms = ", ".join(r.get("symbol","?").upper() for r in price_ok if r.get("coin_id") in profit_protect_ids)
         rule_summary.append(f"Profit protection: {syms}")
+    if stale_ids:
+        syms = ", ".join(r.get("symbol","?").upper() for r in price_ok if r.get("coin_id") in stale_ids)
+        rule_summary.append(f"Mid-horizon stale: {syms}")
     if expired_ids:
         syms = ", ".join(r.get("symbol","?").upper() for r in price_ok if r.get("coin_id") in expired_ids)
         rule_summary.append(f"Time expired: {syms}")
@@ -204,7 +215,7 @@ def run_phase1_position_management(
     else:
         print(f"  All {len(price_ok)} positions holding — no exit rules triggered")
 
-    auto_close_ids = stop_loss_ids | trailing_stop_ids | take_profit_ids | profit_protect_ids | expired_ids
+    auto_close_ids = stop_loss_ids | trailing_stop_ids | take_profit_ids | profit_protect_ids | stale_ids | expired_ids
 
     # --- Execute closes ---
     closed_records: List[Dict] = []
@@ -260,6 +271,18 @@ def run_phase1_position_management(
             trade_executor.close_position(r)
             closed_records.append(close_record)
             print(f"  [PROFIT PROTECTION] {r.get('symbol', '?').upper()} | Peak: {peak_pct:+.1f}% | Now: {pnl_pct:+.1f}%")
+
+        elif coin_id in stale_ids:
+            pnl_pct = r.get("pnl_pct") or 0
+            horizon = r.get("time_horizon", "?")
+            close_record = _build_close_record(
+                r, "STALE_POSITION",
+                f"Halfway through {horizon} horizon with only {pnl_pct:+.1f}% — thesis not materialising, cutting early"
+            )
+            append_resolved_trade(close_record)
+            trade_executor.close_position(r)
+            closed_records.append(close_record)
+            print(f"  [STALE / EARLY EXIT] {r.get('symbol', '?').upper()} | Horizon: {horizon} | P&L: {pnl_pct:+.1f}%")
 
         elif coin_id in expired_ids:
             pnl_pct = r.get("pnl_pct") or 0

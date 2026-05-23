@@ -289,18 +289,22 @@ class RiskManager:
         self,
         position: Dict[str, Any],
         current_price: float,
-        min_peak_pct: float = 4.0,
-        giveback_fraction: float = 0.5,
+        min_peak_pct: float = 5.0,
+        giveback_fraction: float = 0.35,
     ) -> bool:
-        """Return True when a meaningful gain has reversed by more than half.
+        """Return True when a meaningful gain has reversed significantly.
 
         Once a position peaks at ``min_peak_pct`` or higher, this rule
         closes it if the current gain falls to ≤ ``giveback_fraction`` × peak.
 
-        Examples (defaults: min_peak=4%, giveback=50%):
-            Peak +8%  → close if current ≤ +4%
-            Peak +6%  → close if current ≤ +3%
-            Peak +3%  → rule does NOT activate (below min_peak threshold)
+        Examples (defaults: min_peak=5%, giveback=35%):
+            Peak +8%  → close if current ≤ +2.8%
+            Peak +6%  → close if current ≤ +2.1%
+            Peak +4%  → rule does NOT activate (below min_peak threshold)
+
+        Raised min_peak from 4% to 5%: prevents the rule from firing on tiny
+        bounces that barely moved. Lowered giveback from 50% to 35%: when the
+        rule does fire, it holds on to more of the peak gain before exiting.
 
         Peak gain is derived from the already-tracked ``highest_price`` /
         ``lowest_price`` high-water marks, so no extra state is needed.

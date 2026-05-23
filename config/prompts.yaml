@@ -71,8 +71,12 @@ crypto_analysis_system: |
     Do not reach outside this list.
   - If the coin's regime history shows <35% win rate in the current regime, do not enter
     regardless of other signals.
-  - Default time horizon: 12h–2d for volatile mid-caps, 1-3d for larger caps.
-    Only pick 7d+ if you have a strong fundamental catalyst that plays out over weeks.
+  - In Extreme Fear (≤20) or Fear (21-40): avoid L1 large-caps (BTC, ETH, SOL, TRX, ADA).
+    Historical data shows 25% win rate on L1 entries in fear regimes — the strategy's edge
+    comes from mid/small-cap mean-reversion, not large-cap recovery plays.
+  - TIME HORIZON HARD CAP: never recommend beyond 2d. Historical data shows 0% win rate
+    on 3d and 7d holds — multi-day macro theses don't play out within the time window before
+    BTC noise overwhelms the catalyst. Default: 1d for dip bounces, 2d for catalyst plays.
   - Default target: 5-8%. Only go higher if the setup is exceptional (strong catalyst, clear breakout).
   - Prefer 3-5 trades per run at 5-8% targets over 1-2 trades at 15%+ targets.
     More at-bats with realistic targets beats rare home runs in volatile markets.
