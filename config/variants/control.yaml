@@ -1,3 +1,15 @@
+# CONTROL VARIANT — baseline for A/B comparison
+#
+# Identical to config/config.yaml except for the three things under test:
+#   sizing_method:          flat  (vs vol_target)
+#   meta_labeling_enabled:  false (vs true)
+#
+# Everything else — screen, regime rules, cooldown, barriers, the premature-exit
+# fix — is shared, so any performance difference is attributable to sizing and
+# the secondary model rather than to unrelated drift.
+#
+# Run:  venv/bin/python scripts/intraday_trader.py --config config/variants/control.yaml
+#
 # Crypto Trading Bot Configuration
 
 # LLM Configuration
@@ -24,7 +36,7 @@ trading:
   # Flat $5 meant a 2%/day coin and a 15%/day coin carried wildly different risk
   # for the same notional. Sizing inversely to volatility equalises risk per
   # position — the best-supported single change in the momentum literature.
-  sizing_method: vol_target         # vol_target | flat
+  sizing_method: flat         # vol_target | flat
   base_position_usd: 5.0            # Stake for a coin sitting exactly at target_vol_pct
   min_position_size_usd: 1.0
   target_vol_pct: 3.0               # Expected daily move a full-size position targets
@@ -38,12 +50,12 @@ trading:
   # --- Meta-labeling ------------------------------------------------------------
   # The screen picks the side; the LLM only decides take/skip + size. Until enough
   # uncensored labels accumulate, the secondary model IS the LLM.
-  meta_labeling_enabled: true
+  meta_labeling_enabled: false
   meta_min_training_labels: 100     # Uncensored labels needed before fitting a classifier
 
   # --- Strategy variant ----------------------------------------------------------
   # Tags every trade so parallel variants can be compared without mixing stats.
-  strategy_variant: vol_target_v1
+  strategy_variant: control_flat
 
 # Risk Management
 risk:
@@ -78,9 +90,9 @@ data_sources:
 # Calibration/meta-model files are intentionally NOT listed here — they're keyed
 # by variant internally, so one shared file lets refit_models.py compare variants.
 data:
-  positions_dir: data/positions
-  performance_dir: data/performance
-  trades_dir: data/trades
+  positions_dir: data/variants/control/positions
+  performance_dir: data/variants/control/performance
+  trades_dir: data/variants/control/trades
 
 # Logging
 logging:

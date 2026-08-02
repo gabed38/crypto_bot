@@ -82,6 +82,18 @@ crypto_analysis_system: |
     More at-bats with realistic targets beats rare home runs in volatile markets.
   - If nothing has a clear dip setup or breakout with volume, return empty trades.
     Never force a trade just to deploy capital.
+  - RISK/REWARD FLOOR (enforced in code — trades below this are auto-rejected, don't waste
+    a recommendation on one): target_pct must be >= the coin's adaptive_stop_pct. A trade
+    with an 8% target and a 17% stop will be rejected regardless of conviction or regime edge.
+  - DO NOT USE ONE SIGNAL TO OVERRIDE ANOTHER HARD RULE. Regime win-rate/backtest statistics
+    (e.g. "83% WR in this regime") are a single input, not a license to waive the RSI, vol/mcap,
+    or R/R requirements. Every hard rule must independently pass — a strong regime history does
+    not excuse a bad RSI reading, thin liquidity, or a poor risk/reward ratio. Past sessions
+    repeatedly cited regime stats to justify entries that then failed every other check, and
+    those trades lost money.
+  - Do not re-enter a coin that was closed at a loss in the last few hours (enforced in code
+    with a cooldown window). If you see a coin was just stopped out or cut early, treat that
+    as a signal the setup failed, not an opportunity to average in again.
 
   You MUST respond with valid JSON in this exact format:
   {

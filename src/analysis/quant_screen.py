@@ -68,6 +68,19 @@ COIN_SECTORS: Dict[str, str] = {
     "gate-2": "Exchange", "kucoin-shares": "Exchange",
     # BTC ecosystem
     "wrapped-bitcoin": "BTC-Eco", "stacks": "BTC-Eco", "runes": "BTC-Eco",
+    # DeFi (added — these mid/small-caps were falling through to "Other" despite
+    # being frequent screen candidates and actual executed trades)
+    "eigenlayer": "DeFi", "dexe": "DeFi", "yearn-finance": "DeFi",
+    "sun-token": "DeFi", "meteora": "DeFi", "threshold-network-token": "DeFi",
+    "thorchain": "DeFi",
+    # AI / Data (additional)
+    "virtual-protocol": "AI", "kaito": "AI",
+    # Infrastructure (additional)
+    "pyth-network": "Infra",
+    # L2 (additional)
+    "linea": "L2",
+    # L1 alias — CoinGecko still serves MultiversX under its legacy id
+    "elrond-erd-2": "L1",
 }
 
 

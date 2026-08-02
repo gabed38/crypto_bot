@@ -52,9 +52,17 @@ from src.analysis.quant_screen import (
     check_sector_concentration, get_market_regime,
 )
 from src.analysis.coin_profiles import load_profiles, format_profiles_for_llm
+from src.analysis.labeling import compute_barriers, label_closed_trade
+from src.analysis.calibration import PlattCalibrator
+from src.analysis.meta_labeler import MetaLabeler
+from src.trading.sizing import size_crypto_trade
 from src.trading.executor import TradeExecutor
 from src.trading.risk import RiskManager
 
+# Imported as a module (not `from helpers import POSITIONS_FILE`) so that the
+# path constants are read live — configure_paths() rebinds them at startup, and
+# names bound at import time would keep pointing at the default variant's files.
+import helpers
 from helpers import (
     load_open_positions,
     save_open_positions,
@@ -64,11 +72,9 @@ from helpers import (
     evaluate_position,
     check_time_horizon_expired,
     check_mid_horizon_stale,
+    configure_paths,
     save_lessons,
     load_recent_lessons,
-    POSITIONS_FILE,
-    RESOLVED_FILE,
-    LESSONS_FILE,
 )
 
 
@@ -318,8 +324,13 @@ def run_phase1_position_management(
 
 
 def _build_close_record(position: Dict, close_type: str, close_reason: str) -> Dict:
-    """Build a close record for a position."""
-    return {
+    """Build a close record for a position.
+
+    Stamps the triple-barrier label at close time so the resolved-trade history is
+    directly usable as training data for the secondary model, and so discretionary
+    early exits are marked censored rather than being mistaken for real outcomes.
+    """
+    record = {
         **position,
         "trade_result": "CLOSED_EARLY",
         "close_type": close_type,
@@ -327,6 +338,8 @@ def _build_close_record(position: Dict, close_type: str, close_reason: str) -> D
         "close_price": position.get("latest_price"),
         "resolved_at": datetime.now().isoformat(),
     }
+    record.update(label_closed_trade(record))
+    return record
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -579,6 +592,23 @@ def run_phase2_new_trades(
     # Also keep original full coin lookup for any coin Claude might reference
     full_coin_lookup = {c.get("id", ""): c for c in coins}
 
+    # Re-entry cooldown — coins closed at a loss recently are off-limits for a
+    # few hours. Lesson history showed same-day revenge re-entries (e.g. a coin
+    # closed at 12:00 re-bought at 12:17) that repeated the same failed thesis.
+    cooldown_hours = config.get("trading.reentry_cooldown_hours", 6)
+    cooldown_coin_ids: set = set()
+    for closed in load_recent_resolved(days=1):
+        if (closed.get("pnl_pct") or 0) >= 0:
+            continue
+        resolved_at = closed.get("resolved_at", "")
+        try:
+            resolved_dt = datetime.fromisoformat(resolved_at)
+        except Exception:
+            continue
+        hours_since_close = (datetime.now() - resolved_dt).total_seconds() / 3600
+        if hours_since_close < cooldown_hours:
+            cooldown_coin_ids.add(closed.get("coin_id", ""))
+
     enriched: List[Dict] = []
     for trade in all_trades:
         coin_id = trade.get("coin_id", "")
@@ -586,6 +616,12 @@ def run_phase2_new_trades(
         # Skip coins already held
         if coin_id in held_coins:
             logger.info(f"Skipping {coin_id} — already held")
+            continue
+
+        # Skip coins closed at a loss within the cooldown window
+        if coin_id in cooldown_coin_ids:
+            logger.info(f"Skipping {coin_id} — re-entry cooldown ({cooldown_hours}h after loss)")
+            trade_executor.save_rejected_trades([trade], f"Re-entry cooldown ({cooldown_hours}h after loss)")
             continue
 
         # Prefer screened data, fall back to full coin list
@@ -617,6 +653,66 @@ def run_phase2_new_trades(
                 trade[field] = coin_data[field]
 
         enriched.append(trade)
+
+    # Risk/reward hard gate — reject trades where the stop is as wide or wider than
+    # the target. Lessons repeatedly flagged 1:1-or-worse R/R trades (e.g. 8% target
+    # vs 17.4% stop) that got justified by regime win-rate stats and then lost anyway.
+    # Enforced here in code so it can't be reasoned around in the prompt.
+    rr_ok: List[Dict] = []
+    rr_rejected: List[Dict] = []
+    for trade in enriched:
+        target = float(trade.get("target_pct") or 0)
+        stop = float(trade.get("adaptive_stop_pct") or trade.get("stop_loss_pct") or 0)
+        if stop > 0 and target < stop:
+            rr_rejected.append(trade)
+        else:
+            rr_ok.append(trade)
+    if rr_rejected:
+        syms = ", ".join(f"{t.get('symbol','?').upper()} ({t.get('target_pct')}% tgt / {t.get('adaptive_stop_pct') or t.get('stop_loss_pct')}% stop)" for t in rr_rejected)
+        print(f"  Rejected {len(rr_rejected)} trades on R/R < 1:1: {syms}")
+        trade_executor.save_rejected_trades(rr_rejected, "Risk/reward worse than 1:1 (target_pct < stop_pct)")
+    enriched = rr_ok
+
+    # --- Secondary model (meta-labeling) ----------------------------------------
+    # The screen already chose the side; this stage answers only "is this one worth
+    # taking?" While the classifier is unfitted it defers to the LLM's conviction,
+    # so behaviour is unchanged until there's enough labelled history to do better.
+    if config.get("trading.meta_labeling_enabled", False):
+        variant_name = config.get("trading.strategy_variant", "default")
+        meta = MetaLabeler.load(
+            variant=variant_name,
+            min_training_labels=config.get("trading.meta_min_training_labels", 100),
+        )
+        trainable_labels = sum(
+            1 for t in load_recent_resolved(days=3650) if not t.get("tb_censored", True)
+        )
+        print(f"  Secondary model: {meta.status(trainable_labels)}")
+
+        # Record the calibrated probability for diagnostics only — deliberately NOT
+        # used as the gate. Calibrated probabilities cluster near the base rate, so
+        # comparing one to a 0.68 conviction threshold would reject everything for
+        # the wrong reason. The gate moves onto this scale once the secondary model
+        # is a fitted classifier rather than the LLM.
+        calibrator = PlattCalibrator.load(variant=variant_name)
+
+        meta_kept, meta_skipped = [], []
+        for trade in enriched:
+            trade["calibrated_prob"] = round(
+                calibrator.transform(float(trade.get("conviction", 0) or 0)), 4
+            )
+            trade["calibrator_fitted"] = calibrator.fitted
+            trade.update(meta.decide(trade, threshold=regime_min_conviction))
+            (meta_kept if trade["meta_decision"] == "take" else meta_skipped).append(trade)
+        if meta_skipped:
+            syms = ", ".join(
+                f"{t.get('symbol','?').upper()}({t.get('meta_confidence', 0):.2f})"
+                for t in meta_skipped
+            )
+            trade_executor.save_rejected_trades(
+                meta_skipped, f"Secondary model skip ({meta.backend})"
+            )
+            print(f"  Secondary model skipped {len(meta_skipped)}: {syms}")
+        enriched = meta_kept
 
     # Filter by conviction — regime overrides config floor
     min_conviction = regime_min_conviction
@@ -668,10 +764,37 @@ def run_phase2_new_trades(
         print("  No trades after filters")
         return []
 
-    # Attach investment amount
+    # --- Sizing: equal risk per position, not equal notional -------------------
     max_pos_usd = config.get("trading.max_position_size_usd", 5.0)
+    variant = config.get("trading.strategy_variant", "default")
+    sizing_cfg = {
+        "sizing_method": config.get("trading.sizing_method", "flat"),
+        "base_position_usd": config.get("trading.base_position_usd", 5.0),
+        "max_position_size_usd": max_pos_usd,
+        "min_position_size_usd": config.get("trading.min_position_size_usd", 1.0),
+        "target_vol_pct": config.get("trading.target_vol_pct", 3.0),
+    }
+    barrier_cfg = {
+        "profit_mult": config.get("trading.barrier_profit_mult", 2.0),
+        "stop_mult": config.get("trading.barrier_stop_mult", 2.0),
+    }
     for trade in limited:
-        trade["amount_invested"] = round(float(max_pos_usd), 2)
+        trade.update(size_crypto_trade(trade, sizing_cfg))
+        # Record the volatility-scaled barriers this trade will be judged against,
+        # so the triple-barrier label at close time is reproducible.
+        trade.update(compute_barriers(
+            trade.get("daily_vol_pct"),
+            profit_mult=barrier_cfg["profit_mult"],
+            stop_mult=barrier_cfg["stop_mult"],
+        ))
+        trade["strategy_variant"] = variant
+
+    if sizing_cfg["sizing_method"] == "vol_target":
+        detail = ", ".join(
+            f"{t.get('symbol','?').upper()} ${t['amount_invested']:.2f}"
+            f"({t.get('sizing_scale_factor', 1):.2f}x)" for t in limited
+        )
+        print(f"  Vol-targeted sizing: {detail}")
 
     # Global risk check
     today_key = datetime.now().strftime("%Y-%m-%d")
@@ -699,7 +822,7 @@ def run_phase2_new_trades(
 
     # Add to open positions
     add_to_open_positions(executed)
-    print(f"  Updated open positions file ({POSITIONS_FILE})")
+    print(f"  Updated open positions file ({helpers.POSITIONS_FILE})")
 
     # Print trade summary
     if executed:
@@ -794,7 +917,7 @@ def run_phase3_post_trade_analysis(
     for lesson in analysis.get("lessons", [])[:3]:
         print(f"    - {lesson}")
 
-    print(f"\n  Lessons saved to {LESSONS_FILE}")
+    print(f"\n  Lessons saved to {helpers.LESSONS_FILE}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -805,20 +928,36 @@ def main():
     parser = argparse.ArgumentParser(description="Crypto trading bot — intraday session")
     parser.add_argument("--skip-new-trades", action="store_true", help="Skip Phase 2 (new trade discovery)")
     parser.add_argument("--skip-closes", action="store_true", help="Skip Phase 1 (position management)")
+    parser.add_argument(
+        "--config", default="config/config.yaml",
+        help="Config file to run under. Point parallel cron entries at different "
+             "files to A/B strategy variants against identical market conditions.",
+    )
     args = parser.parse_args()
+
+    # ── Setup ─────────────────────────────────────────────────────────────────
+    config = Config(args.config)
+    variant = config.get("trading.strategy_variant", "default")
+
+    # Isolate this variant's state before anything reads or writes it. Without
+    # this, two variants would share one open_positions.json and each would close
+    # the other's trades under its own exit rules.
+    configure_paths(
+        positions_dir=config.get("data.positions_dir"),
+        performance_dir=config.get("data.performance_dir"),
+    )
 
     print("=" * 80)
     print("CRYPTO BOT — Intraday Trading Session")
     print(f"Timestamp: {datetime.now().isoformat()}")
+    print(f"Config: {args.config}  |  Variant: {variant}")
     print("=" * 80)
 
-    # ── Setup ─────────────────────────────────────────────────────────────────
-    config = Config()
     logger = setup_logger(
         log_level=config.get("logging.level", "INFO"),
         log_dir=config.get("logging.log_dir", "logs"),
         log_to_file=config.get("logging.log_to_file", True),
-        script_name="intraday_trader",
+        script_name=f"intraday_trader_{variant}" if variant != "default" else "intraday_trader",
     )
 
     # Load prompts
@@ -841,7 +980,10 @@ def main():
         max_tokens=config.get("llm.max_tokens", 4000),
         temperature=config.get("llm.temperature", 0.7),
     )
-    trade_executor = TradeExecutor(enabled=config.get("trading.enabled", False))
+    trade_executor = TradeExecutor(
+        enabled=config.get("trading.enabled", False),
+        output_dir=config.get("data.trades_dir", "data/trades"),
+    )
     risk_manager = RiskManager(
         max_daily_loss_pct_of_committed=config.get("risk.max_daily_loss_pct_of_committed", 0.25),
         max_daily_loss_floor_usd=config.get("risk.max_daily_loss_floor_usd", 5.0),

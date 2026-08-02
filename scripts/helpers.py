@@ -17,6 +17,31 @@ RESOLVED_FILE = Path("data/positions/resolved_trades.jsonl")
 LESSONS_FILE = Path("data/performance/lessons.json")
 
 
+def configure_paths(positions_dir: Optional[str] = None,
+                    performance_dir: Optional[str] = None) -> None:
+    """Point the bot's state files at a variant-specific directory.
+
+    Parallel strategy variants MUST NOT share these files. If they did, variant B's
+    run would load variant A's open positions and close them under B's exit rules —
+    the trade would be attributed to A but exited by B, making both datasets
+    worthless. Isolating the directories keeps each variant a clean experiment.
+
+    Calibration and meta-model files are deliberately NOT isolated: they're keyed by
+    variant internally, so one shared file lets `refit_models.py` compare variants
+    side by side.
+
+    Called once at startup. With no arguments the defaults are unchanged, so the
+    existing cron entry keeps behaving exactly as before.
+    """
+    global POSITIONS_FILE, RESOLVED_FILE, LESSONS_FILE
+    if positions_dir:
+        base = Path(positions_dir)
+        POSITIONS_FILE = base / "open_positions.json"
+        RESOLVED_FILE = base / "resolved_trades.jsonl"
+    if performance_dir:
+        LESSONS_FILE = Path(performance_dir) / "lessons.json"
+
+
 # ── position file helpers ─────────────────────────────────────────────────────
 
 def load_open_positions() -> List[Dict]:
@@ -53,6 +78,15 @@ def add_to_open_positions(trades: List[Dict]) -> None:
         "adaptive_stop_pct", "sector",
         # Market snapshot at entry
         "market_cap", "volume_24h", "price_change_24h",
+        # Sizing audit trail — separates a bad entry from a badly sized one
+        "sizing_method", "target_vol_pct", "sizing_daily_vol_pct",
+        "sizing_scale_factor", "strategy_variant", "calibrated_prob", "calibrator_fitted",
+        # Triple-barrier definition, stamped at entry so the close-time label
+        # is reproducible against the barriers actually in force
+        "profit_barrier_pct", "stop_barrier_pct", "barrier_basis",
+        "barrier_profit_mult", "barrier_stop_mult",
+        # Meta-labeling decision record
+        "meta_decision", "meta_source", "meta_confidence",
     )
     for trade in trades:
         key = trade.get("coin_id", "") + trade.get("direction", "LONG")
@@ -110,6 +144,28 @@ def _parse_horizon_days(horizon_str: str) -> Optional[int]:
     return {"d": value, "w": value * 7, "m": value * 30}[unit]
 
 
+def _resolve_opened_at(position: Dict) -> Optional[datetime]:
+    """Return the actual entry datetime for a position.
+
+    Prefers the full execution_timestamp (e.g. "2026-06-25T12:17:00") so elapsed-time
+    checks measure from the real fill time. Falls back to execution_date at midnight
+    only when no timestamp is available.
+    """
+    ts = position.get("execution_timestamp")
+    if ts:
+        try:
+            return datetime.fromisoformat(str(ts))
+        except Exception:
+            pass
+    date_str = position.get("execution_date")
+    if date_str:
+        try:
+            return datetime.fromisoformat(str(date_str)[:10])
+        except Exception:
+            pass
+    return None
+
+
 def check_mid_horizon_stale(
     position: Dict,
     stale_pnl_threshold: float = 0.5,
@@ -122,13 +178,6 @@ def check_mid_horizon_stale(
 
     Not called when pnl is unavailable (price fetch failed) — stays open in that case.
     """
-    exec_str = (
-        position.get("execution_date")
-        or position.get("execution_timestamp", "")
-    )
-    if not exec_str:
-        return False
-
     horizon_days = _parse_horizon_days(position.get("time_horizon", ""))
     if horizon_days is None:
         return False
@@ -137,39 +186,31 @@ def check_mid_horizon_stale(
     if pnl_pct is None:
         return False
 
-    try:
-        opened = datetime.fromisoformat(str(exec_str)[:10])
-        days_held = (datetime.now() - opened).total_seconds() / 86400
-        if days_held >= horizon_days / 2 and pnl_pct < stale_pnl_threshold:
-            return True
-    except Exception:
-        pass
-    return False
+    opened = _resolve_opened_at(position)
+    if opened is None:
+        return False
+
+    days_held = (datetime.now() - opened).total_seconds() / 86400
+    return days_held >= horizon_days / 2 and pnl_pct < stale_pnl_threshold
 
 
 def check_time_horizon_expired(position: Dict) -> bool:
     """Return True if the position has been held at least as long as its time_horizon.
 
-    Uses execution_date (YYYY-MM-DD) if present, falls back to execution_timestamp.
-    Returns False when either field is missing or unparseable.
+    Uses the full execution_timestamp when present so elapsed time is measured from
+    the actual fill, falling back to execution_date (midnight) only if no timestamp
+    was recorded. Returns False when neither field is present or parseable.
     """
-    exec_str = (
-        position.get("execution_date")
-        or position.get("execution_timestamp", "")
-    )
-    if not exec_str:
-        return False
-
     horizon_days = _parse_horizon_days(position.get("time_horizon", ""))
     if horizon_days is None:
         return False
 
-    try:
-        opened = datetime.fromisoformat(str(exec_str)[:10])
-        days_held = (datetime.now() - opened).days
-        return days_held >= horizon_days
-    except Exception:
+    opened = _resolve_opened_at(position)
+    if opened is None:
         return False
+
+    days_held = (datetime.now() - opened).total_seconds() / 86400
+    return days_held >= horizon_days
 
 
 # ── position evaluation ──────────────────────────────────────────────────────
