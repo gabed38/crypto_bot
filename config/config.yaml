@@ -41,6 +41,16 @@ trading:
   meta_labeling_enabled: true
   meta_min_training_labels: 100     # Uncensored labels needed before fitting a classifier
 
+  # --- Adaptive learning ---------------------------------------------------------
+  # Buckets realised outcomes by segment and BLOCKS segments that confidently lose.
+  # Unlike lessons.json (advisory text an LLM can ignore) this is a code gate.
+  # Suppression requires the UPPER bound of the win-rate interval to sit below
+  # break-even, so a losing streak alone will not trigger it.
+  adaptive_learning_enabled: true
+  adaptive_half_life_days: 90     # Old evidence decays; the system tracks a changing market
+  adaptive_min_samples: 8.0       # Effective (decayed) observations needed before acting
+  adaptive_break_even: 0.5        # Win rate below which a segment is not worth trading
+
   # --- Strategy variant ----------------------------------------------------------
   # Tags every trade so parallel variants can be compared without mixing stats.
   strategy_variant: vol_target_v1

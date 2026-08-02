@@ -55,6 +55,7 @@ from src.analysis.coin_profiles import load_profiles, format_profiles_for_llm
 from src.analysis.labeling import compute_barriers, label_closed_trade
 from src.analysis.calibration import PlattCalibrator
 from src.analysis.meta_labeler import MetaLabeler
+from src.analysis.adaptive import SegmentTracker, GATING_DIMENSIONS
 from src.trading.sizing import size_crypto_trade
 from src.trading.executor import TradeExecutor
 from src.trading.risk import RiskManager
@@ -318,6 +319,23 @@ def run_phase1_position_management(
             remaining_open.append(entry)
 
     save_open_positions(remaining_open)
+
+    # --- Feed the adaptive learner ---------------------------------------------
+    # Every close updates per-segment performance. This is the loop that actually
+    # changes behaviour: segments that prove to lose get blocked at entry on future
+    # runs, mechanically, without an LLM having to read and heed a written lesson.
+    if closed_records and config.get("trading.adaptive_learning_enabled", False):
+        variant = config.get("trading.strategy_variant", "default")
+        tracker = SegmentTracker.load(variant=variant)
+        for record in closed_records:
+            tracker.record(
+                record,
+                GATING_DIMENSIONS,
+                won=(record.get("pnl_pct") or 0) > 0,
+                pnl=record.get("pnl_usd") or 0.0,
+            )
+        tracker.save(variant=variant)
+        print(f"  Adaptive learner updated with {len(closed_records)} outcome(s)")
 
     print(f"\n  Closed {len(closed_records)} position(s)  |  {len(remaining_open)} remain open")
     return closed_records
@@ -713,6 +731,33 @@ def run_phase2_new_trades(
             )
             print(f"  Secondary model skipped {len(meta_skipped)}: {syms}")
         enriched = meta_kept
+
+    # --- Adaptive segment gate --------------------------------------------------
+    # Blocks candidates belonging to a segment that has confidently proven to lose.
+    # Only fires when the UPPER bound of the segment's win-rate interval is below
+    # break-even, so a bad streak is not enough — the evidence has to be real.
+    if config.get("trading.adaptive_learning_enabled", False):
+        tracker = SegmentTracker.load(variant=config.get("trading.strategy_variant", "default"))
+        tracker.min_samples = config.get("trading.adaptive_min_samples", 8.0)
+        tracker.half_life_days = config.get("trading.adaptive_half_life_days", 90.0)
+        break_even = config.get("trading.adaptive_break_even", 0.5)
+
+        # Regime is a decision-time property of the run, not of the coin
+        for trade in enriched:
+            trade.setdefault("regime", regime["name"])
+
+        adaptive_kept, adaptive_blocked = [], []
+        for trade in enriched:
+            trade.update(tracker.evaluate_trade(trade, GATING_DIMENSIONS, break_even))
+            (adaptive_blocked if trade["adaptive_blocked"] else adaptive_kept).append(trade)
+        if adaptive_blocked:
+            for t in adaptive_blocked:
+                why = "; ".join(b["reason"] for b in t["adaptive_blocked_by"])
+                print(f"  Adaptive block {t.get('symbol','?').upper()}: {why}")
+            trade_executor.save_rejected_trades(
+                adaptive_blocked, "Adaptive segment suppression (proven losing segment)"
+            )
+        enriched = adaptive_kept
 
     # Filter by conviction — regime overrides config floor
     min_conviction = regime_min_conviction

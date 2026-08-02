@@ -34,6 +34,7 @@ from src.analysis.calibration import (
 )
 from src.analysis.labeling import label_closed_trade
 from src.analysis.meta_labeler import MetaLabeler
+from src.analysis.adaptive import SegmentTracker, GATING_DIMENSIONS, DIAGNOSTIC_DIMENSIONS
 
 RESOLVED_FILE = Path("data/positions/resolved_trades.jsonl")
 
@@ -178,6 +179,38 @@ def main() -> int:
                     print("  saved (as 'untagged' and 'default').")
                 else:
                     print("  saved.")
+
+        # Adaptive segment tracker — rebuilt from full history so it reflects
+        # everything, not only what accumulated since it was switched on.
+        tracker = SegmentTracker.rebuild_from_history(
+            vtrades,
+            GATING_DIMENSIONS + DIAGNOSTIC_DIMENSIONS,
+            outcome_fn=lambda t: 1 if (t.get("pnl_pct") or 0) > 0 else 0,
+            half_life_days=90.0,
+            min_samples=8.0,
+        )
+        rows = tracker.report(break_even=0.5)
+        if rows:
+            print(f"\n  segment performance (worst first):")
+            print(f"    {'segment':<26}{'n_eff':>7}{'win%':>7}{'CI hi':>7}{'P&L':>9}  status")
+            for r in rows[:14]:
+                gate = "BLOCKED" if r["suppressed"] else ""
+                leaky = any(r["segment"].startswith(d + "=") for d in DIAGNOSTIC_DIMENSIONS)
+                note = "  (diagnostic only)" if leaky else ""
+                print(f"    {r['segment']:<26}{r['n_effective']:>7.1f}"
+                      f"{r['win_rate']*100:>6.0f}%{r['ci_high']*100:>6.0f}%"
+                      f"{r['total_pnl']:>9.2f}  {gate}{note}")
+        if not args.dry_run:
+            # Persist only the gating dimensions; diagnostics must never gate.
+            gate_tracker = SegmentTracker.rebuild_from_history(
+                vtrades, GATING_DIMENSIONS,
+                outcome_fn=lambda t: 1 if (t.get("pnl_pct") or 0) > 0 else 0,
+                half_life_days=90.0, min_samples=8.0,
+            )
+            gate_tracker.save(variant=variant)
+            if variant == "untagged":
+                gate_tracker.save(variant="default")
+            print("  segment tracker saved.")
 
         meta = MetaLabeler(min_training_labels=args.min_labels).fit(vtrades)
         if meta.fitted:
