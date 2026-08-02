@@ -79,6 +79,10 @@ scripts/
   refit_models.py       Refit calibrator + secondary model; per-variant report.
   build_coin_profiles.py  Weekly job producing per-coin regime history.
 
+dashboard/
+  app.py                Streamlit UI. Rebuilt 2026-08-01: Brier/skill lead, win rate
+                        demoted, variant filter so A/B arms don't average together.
+
 src/
   data_ingestion/
     crypto_prices.py    CoinGecko client (free tier, rate-limited — expect 429s)

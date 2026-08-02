@@ -1,51 +1,69 @@
 """
 Crypto Trading Bot Dashboard
-Run with: streamlit run dashboard/app.py
+
+Run with: venv/bin/streamlit run dashboard/app.py
+
+Rebuilt 2026-08-01 for the calibration/meta-labeling redesign.
+
+Two deliberate changes from the previous version:
+
+  1. Win rate is no longer the headline. It is the metric that let a signal with a
+     -1.47 skill score look healthy. Brier and skill score lead instead; win rate is
+     still shown, demoted, because it is intuitive — not because it is informative.
+
+  2. Everything is filterable by strategy_variant. Without that, parallel A/B arms
+     average together in one view and the experiment is invisible.
 """
 
 import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# ── path setup ────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.analysis.pnl_tracker import PnLTracker, _amount_invested, _pnl_usd
+from src.analysis.calibration import (
+    PlattCalibrator,
+    brier_score,
+    expected_calibration_error,
+    reference_brier,
+    reliability_curve,
+    skill_score,
+)
+from src.analysis.labeling import label_closed_trade
+from src.analysis.meta_labeler import MetaLabeler
+from src.analysis.adaptive import (
+    DIAGNOSTIC_DIMENSIONS,
+    GATING_DIMENSIONS,
+    SegmentTracker,
+)
 
-# ── data paths ────────────────────────────────────────────────────────────────
 OPEN_POSITIONS_FILE = ROOT / "data/positions/open_positions.json"
 RESOLVED_FILE = ROOT / "data/positions/resolved_trades.jsonl"
 LESSONS_FILE = ROOT / "data/performance/lessons.json"
 
-DIRECTION_COLORS = {"LONG": "#00A86B", "SHORT": "#FF6B6B"}
-RESULT_COLORS = {"WIN": "#00A86B", "LOSS": "#FF6B6B", "CLOSED_EARLY": "#FFA500", "UNREALIZED": "#888888"}
+GOOD, BAD, WARN, MUTED = "#2f7d5a", "#a94442", "#c98a2e", "#8f90a6"
 
-# ── page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Crypto Bot Dashboard",
-    page_icon="₿",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
+st.set_page_config(page_title="Crypto Bot", page_icon="₿", layout="wide",
+                   initial_sidebar_state="expanded")
 st.markdown("""
 <style>
-    .metric-card { background: #1e1e2e; border-radius: 8px; padding: 12px 16px; }
-    .stDataFrame { font-size: 13px; }
-    div[data-testid="stMetricValue"] { font-size: 1.6rem; }
+  .stDataFrame { font-size: 13px; }
+  div[data-testid="stMetricValue"] { font-size: 1.5rem; }
+  .note { color: #8f90a6; font-size: 0.86rem; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── data loaders ──────────────────────────────────────────────────────────────
+# ── loaders ───────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60)
 def load_open_positions() -> List[Dict]:
@@ -60,8 +78,13 @@ def load_open_positions() -> List[Dict]:
 
 @st.cache_data(ttl=60)
 def load_resolved_trades() -> List[Dict]:
-    tracker = PnLTracker(RESOLVED_FILE)
-    return tracker.load_resolved()
+    trades = PnLTracker(RESOLVED_FILE).load_resolved()
+    # Stamp triple-barrier labels on older rows that predate the labeler, so
+    # censored early exits are excluded from scoring rather than counted as real.
+    for t in trades:
+        if "tb_label" not in t:
+            t.update(label_closed_trade(t))
+    return trades
 
 
 @st.cache_data(ttl=60)
@@ -75,465 +98,389 @@ def load_lessons() -> List:
         return []
 
 
-VOL_SIGNAL_COLORS = {
-    "LOW":     "#00A86B",
-    "MEDIUM":  "#F7931A",
-    "HIGH":    "#FF6B6B",
-    "EXTREME": "#CC0000",
-    "UNKNOWN": "#888888",
-}
-
-def _vol_badge(signal: str) -> str:
-    """Return a coloured HTML badge for a vol signal."""
-    color = VOL_SIGNAL_COLORS.get(signal, "#888888")
-    return f'<span style="background:{color};color:#fff;padding:2px 6px;border-radius:4px;font-size:0.75em">{signal}</span>'
+def variants_in(trades: List[Dict]) -> List[str]:
+    return sorted({t.get("strategy_variant") or "untagged" for t in trades})
 
 
-def open_positions_df(positions: List[Dict]) -> pd.DataFrame:
-    rows = []
-    for p in positions:
-        entry = p.get("entry_price") or 0
-        latest = p.get("latest_price") or entry
-        unrealized_pct = p.get("pnl_pct")
-        unrealized_usd = p.get("pnl_usd")
-
-        if unrealized_pct is None and entry and latest and entry > 0:
-            direction = p.get("direction", "LONG")
-            if direction == "LONG":
-                unrealized_pct = round((latest - entry) / entry * 100, 1)
-            else:
-                unrealized_pct = round((entry - latest) / entry * 100, 1)
-            amt = p.get("amount_invested") or 5.0
-            unrealized_usd = round((unrealized_pct / 100) * amt, 2)
-
-        # Trailing stop info
-        trailing_stop = p.get("trailing_stop_price")
-        hwm = p.get("highest_price") or p.get("lowest_price")
-
-        rows.append({
-            "Coin": f"{p.get('symbol', '?').upper()} ({p.get('coin_name', '')})",
-            "Sector": p.get("sector", "Other"),
-            "Direction": p.get("direction", "LONG"),
-            "Entry": entry,
-            "Now": latest,
-            "Unrlzd %": unrealized_pct,
-            "Unrlzd $": unrealized_usd,
-            "Trailing Stop": trailing_stop,
-            "HWM": hwm,
-            "Vol/day": p.get("daily_vol_pct"),
-            "Stop×": p.get("stop_multiple"),
-            "Vol Risk": p.get("vol_signal", "UNKNOWN"),
-            "Invested": p.get("amount_invested") or 5.0,
-            "Conviction": p.get("conviction"),
-            "Horizon": p.get("time_horizon", "?"),
-            "Open Since": p.get("execution_date", "?"),
-        })
-    return pd.DataFrame(rows)
+def tb_outcome(trade: Dict) -> Optional[int]:
+    """Binary outcome for scoring: did the profit barrier get hit first?"""
+    lab = trade.get("tb_label")
+    return None if lab is None else (1 if lab == 1 else 0)
 
 
-def resolved_trades_df(trades: List[Dict]) -> pd.DataFrame:
-    rows = []
-    for t in trades:
-        ts = t.get("resolved_at") or t.get("executed_at") or ""
-        date = ts[:10] if ts else "?"
-        rows.append({
-            "Date": date,
-            "Coin": f"{t.get('symbol', '?').upper()}",
-            "Direction": t.get("direction", "LONG"),
-            "Result": t.get("trade_result", "?"),
-            "Close Type": t.get("close_type", ""),
-            "Entry": t.get("entry_price"),
-            "Exit": t.get("close_price") or t.get("latest_price"),
-            "P&L %": t.get("pnl_pct"),
-            "P&L $": t.get("pnl_usd"),
-            "Invested": t.get("amount_invested"),
-            "Conviction": t.get("conviction"),
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("Date", ascending=False)
-    return df
+# ── sidebar: variant filter ───────────────────────────────────────────────────
 
+all_resolved = load_resolved_trades()
+all_open = load_open_positions()
 
-def color_pnl(val):
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return ""
-    return "color: #00A86B" if float(val) >= 0 else "color: #FF6B6B"
+st.sidebar.header("Filters")
+variant_options = ["All variants"] + variants_in(all_resolved + all_open)
+chosen = st.sidebar.selectbox(
+    "Strategy variant", variant_options,
+    help="Parallel A/B arms write to isolated state. Compare them here rather than "
+         "averaging them together.",
+)
+if chosen != "All variants":
+    resolved = [t for t in all_resolved if (t.get("strategy_variant") or "untagged") == chosen]
+    positions = [p for p in all_open if (p.get("strategy_variant") or "untagged") == chosen]
+else:
+    resolved, positions = all_resolved, all_open
 
-
-def style_resolved_df(df: pd.DataFrame):
-    return (
-        df.style
-        .applymap(color_pnl, subset=["P&L %", "P&L $"])
-        .format({
-            "Entry": lambda v: f"${v:,.4f}" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-            "Exit":  lambda v: f"${v:,.4f}" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-            "P&L %": lambda v: f"{v:+.1f}%" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-            "P&L $": lambda v: f"${v:+.2f}"  if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-            "Invested": lambda v: f"${v:.2f}"  if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-            "Conviction": lambda v: f"{v:.2f}" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-        }, na_rep="-")
-    )
-
-
-# ── tabs ──────────────────────────────────────────────────────────────────────
-
-st.title("₿ Crypto Trading Bot Dashboard")
-st.caption(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Auto-refreshes every 60s")
-
-tab_open, tab_resolved, tab_pnl, tab_lessons = st.tabs(
-    ["Open Positions", "Closed Trades", "P&L Analytics", "Lessons"]
+exclude_censored = st.sidebar.checkbox(
+    "Exclude censored exits from scoring", value=True,
+    help="Discretionary early exits (STALE_POSITION, STRATEGY_RESET) describe the exit "
+         "logic in force at the time, not whether the entry had merit. 20 of the first "
+         "52 trades were censored artifacts of the premature-exit bug.",
 )
 
-positions = load_open_positions()
-resolved = load_resolved_trades()
-lessons = load_lessons()
-tracker = PnLTracker(RESOLVED_FILE)
+st.sidebar.markdown("---")
+st.sidebar.markdown(
+    f"<span class='note'>{len(all_resolved)} resolved · {len(all_open)} open<br>"
+    f"Refreshed {datetime.now().strftime('%H:%M:%S')}</span>",
+    unsafe_allow_html=True,
+)
+
+st.title("₿ Crypto Trading Bot")
+st.caption(f"Variant: **{chosen}** · paper trading only")
+
+if not all_resolved and not all_open:
+    st.info("No trades yet. The redesign has not executed a trade — the next cron run "
+            "is the first one under the new code.")
+
+tab_scoring, tab_models, tab_open, tab_resolved, tab_pnl, tab_lessons = st.tabs(
+    ["Scoring", "Models & Learning", "Open", "Resolved", "P&L", "Lessons"]
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — OPEN POSITIONS
+# SCORING — the headline. Brier and skill, not win rate.
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_scoring:
+    scored = [t for t in resolved
+              if tb_outcome(t) is not None and t.get("conviction") is not None]
+    if exclude_censored:
+        scored = [t for t in scored if not t.get("tb_censored", False)]
+
+    if not scored:
+        st.info("Nothing scoreable yet. Scoring needs a conviction score and a "
+                "triple-barrier outcome on the same trade.")
+    else:
+        probs = [float(t["conviction"]) for t in scored]
+        outs = [tb_outcome(t) for t in scored]
+
+        bs = brier_score(probs, outs)
+        ref = reference_brier(outs)
+        sk = skill_score(probs, outs)
+        ece = expected_calibration_error(probs, outs)
+        wins = sum(outs)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Brier", f"{bs:.3f}", help="Lower is better. 0.25 = always guessing 50%.")
+        c2.metric("Base-rate Brier", f"{ref:.3f}",
+                  help="What you'd score knowing only how often trades win. The number to beat.")
+        c3.metric("Skill score", f"{sk:+.3f}",
+                  delta="beats base rate" if sk and sk > 0 else "worse than base rate",
+                  delta_color="normal" if sk and sk > 0 else "inverse",
+                  help="1 - (model Brier / base-rate Brier). Negative means the score is "
+                       "actively worse than knowing nothing.")
+        c4.metric("Calibration error", f"{ece:.3f}",
+                  help="Mean gap between stated confidence and realised frequency.")
+        c5.metric("Win rate", f"{100 * wins / len(outs):.0f}%",
+                  help="Shown because it's intuitive, not because it's informative — "
+                       "this is the metric that made a -1.47 skill score look healthy.")
+
+        if sk is not None and sk < 0:
+            st.warning(
+                f"**Skill score is negative ({sk:+.3f}).** The conviction score is doing "
+                f"worse than simply knowing the base rate. Do not gate or size on it "
+                f"directly — route it through the calibrator.", icon="⚠️")
+
+        st.subheader("Reliability — stated vs. delivered")
+        curve = reliability_curve(probs, outs, n_bins=6)
+        if curve:
+            cdf = pd.DataFrame(curve)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
+                                     line=dict(dash="dash", color=MUTED),
+                                     name="perfect calibration"))
+            fig.add_trace(go.Scatter(
+                x=cdf["mean_forecast"], y=cdf["observed_freq"], mode="markers+lines",
+                marker=dict(size=cdf["n"].clip(6, 28), color=GOOD), name="actual",
+                hovertemplate="stated %{x:.2f}<br>actual %{y:.2f}<extra></extra>"))
+            fig.update_layout(height=380, xaxis_title="stated probability",
+                              yaxis_title="observed frequency",
+                              xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1]))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(
+                cdf[["bin_low", "bin_high", "n", "mean_forecast", "observed_freq", "gap"]],
+                use_container_width=True, hide_index=True)
+            st.caption("Points below the dashed line mean overconfidence — the model "
+                       "claimed more than it delivered.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELS & LEARNING
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_models:
+    variant_key = chosen if chosen != "All variants" else "default"
+
+    st.subheader("Calibrator")
+    cal = PlattCalibrator.load(variant=variant_key)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Status", "fitted" if cal.fitted else "not fitted")
+    c2.metric("Samples", cal.n_samples)
+    c3.metric("Method", PlattCalibrator.recommend_method(cal.n_samples).split("—")[0].strip())
+    if cal.fitted:
+        m = cal.fit_metrics or {}
+        mc1, mc2, mc3 = st.columns(3)
+        if m.get("brier_raw") is not None:
+            mc1.metric("Brier raw → calibrated",
+                       f"{m['brier_raw']:.3f} → {m['brier_calibrated']:.3f}")
+        if m.get("ece_raw") is not None:
+            mc2.metric("ECE raw → calibrated", f"{m['ece_raw']:.3f} → {m['ece_calibrated']:.3f}")
+        if m.get("skill_calibrated") is not None:
+            mc3.metric("Skill after calibration", f"{m['skill_calibrated']:+.4f}")
+        pts = [0.60, 0.65, 0.70, 0.75, 0.80, 0.90]
+        mapping = pd.DataFrame({"conviction": pts,
+                                "calibrated probability": [round(cal.transform(p), 3) for p in pts]})
+        st.dataframe(mapping, use_container_width=True, hide_index=True)
+        spread = mapping["calibrated probability"].max() - mapping["calibrated probability"].min()
+        if spread < 0.10:
+            st.info(
+                f"The calibrator compresses the whole conviction range into a "
+                f"{spread:.2f}-wide band around the base rate. That is the calibrator "
+                f"concluding the score carries almost no information — not a bug.", icon="ℹ️")
+    else:
+        st.caption(f"Unfitted — raw conviction passes through unchanged. "
+                   f"Needs {PlattCalibrator.MIN_SAMPLES} samples.")
+
+    st.markdown("---")
+    st.subheader("Secondary model (meta-labeling)")
+    meta = MetaLabeler.load(variant=variant_key)
+    trainable = sum(1 for t in resolved if not t.get("tb_censored", True))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Backend", meta.backend)
+    c2.metric("Uncensored labels", f"{trainable} / {meta.min_training_labels}")
+    c3.metric("AUC", f"{meta.fit_metrics.get('auc'):.3f}"
+              if meta.fitted and meta.fit_metrics.get("auc") else "—")
+    if not meta.fitted:
+        st.caption(
+            f"Dormant by design. The LLM remains the secondary model until "
+            f"{meta.min_training_labels} uncensored labels exist — a classifier fitted "
+            f"on fewer is worse than none, because it looks confident.")
+    if meta.fitted and meta.weights:
+        w = pd.DataFrame({"feature": list(meta.weights), "weight": list(meta.weights.values())})
+        w = w.reindex(w["weight"].abs().sort_values(ascending=False).index)
+        st.plotly_chart(
+            px.bar(w, x="weight", y="feature", orientation="h", height=300, color="weight",
+                   color_continuous_scale=[BAD, MUTED, GOOD]),
+            use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Adaptive segment learning")
+    st.caption("Blocks segments only when the UPPER bound of their win-rate interval "
+               "sits below break-even. A losing streak alone will not trigger it.")
+    tracker = SegmentTracker.rebuild_from_history(
+        resolved, GATING_DIMENSIONS + DIAGNOSTIC_DIMENSIONS,
+        outcome_fn=lambda t: 1 if (t.get("pnl_pct") or 0) > 0 else 0,
+        half_life_days=90.0, min_samples=8.0,
+    )
+    rows = tracker.report(break_even=0.5)
+    if not rows:
+        st.info("No segment data yet.")
+    else:
+        sdf = pd.DataFrame(rows)
+        sdf["gating"] = ~sdf["segment"].str.startswith(
+            tuple(d + "=" for d in DIAGNOSTIC_DIMENSIONS))
+        sdf["status"] = sdf.apply(
+            lambda r: "BLOCKED" if r["suppressed"] and r["gating"]
+            else ("blocked (diagnostic only)" if r["suppressed"] else ""), axis=1)
+        blocked = sdf[sdf["suppressed"] & sdf["gating"]]
+        if len(blocked):
+            st.error(f"{len(blocked)} segment(s) currently blocked at entry: "
+                     + ", ".join(blocked["segment"]), icon="🚫")
+        else:
+            st.success("No segments blocked — either performance is acceptable or "
+                       "evidence is still too thin to act on.", icon="✅")
+        st.dataframe(
+            sdf[["segment", "n_effective", "win_rate", "ci_high", "total_pnl", "status"]]
+            .rename(columns={"n_effective": "n (decayed)", "win_rate": "win rate",
+                             "ci_high": "upper bound", "total_pnl": "P&L"}),
+            use_container_width=True, hide_index=True)
+        st.caption("Win-rate based, so it cannot see P&L-shaped failures — a segment "
+                   "that wins often but loses big stays invisible. Check the P&L column.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPEN POSITIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_open:
     if not positions:
-        st.info("No open positions found.")
+        st.info("No open positions.")
     else:
-        open_df = open_positions_df(positions)
-
-        total_invested = open_df["Invested"].sum()
-        total_unrlzd_usd = open_df["Unrlzd $"].sum() if "Unrlzd $" in open_df else 0
-        total_unrlzd_pct = (total_unrlzd_usd / total_invested * 100) if total_invested > 0 else 0
-
+        sizes = [_amount_invested(p) for p in positions]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Open Positions", len(positions))
-        c2.metric("Total Invested", f"${total_invested:.2f}")
-        c3.metric("Unrealised P&L", f"${total_unrlzd_usd:+.2f}", f"{total_unrlzd_pct:+.1f}%")
-        avg_conv = open_df["Conviction"].mean()
-        c4.metric("Avg Conviction", f"{avg_conv:.2f}" if not pd.isna(avg_conv) else "-")
+        c1.metric("Open", len(positions))
+        c2.metric("Capital at risk", f"${sum(sizes):,.2f}")
+        c3.metric("Unrealised P&L", f"${sum(p.get('pnl_usd') or 0 for p in positions):+,.2f}")
+        c4.metric("Size range", f"${min(sizes):.2f}–${max(sizes):.2f}",
+                  help="Under vol-targeting these should differ — equal risk, not equal notional.")
 
-        st.divider()
+        st.dataframe(pd.DataFrame([{
+            "Symbol": (p.get("symbol") or "?").upper(),
+            "Sector": p.get("sector", "—"),
+            "Entry": p.get("entry_price"),
+            "Latest": p.get("latest_price"),
+            "P&L %": p.get("pnl_pct"),
+            "Invested": _amount_invested(p),
+            "Size×": p.get("sizing_scale_factor"),
+            "Daily vol %": p.get("sizing_daily_vol_pct") or p.get("daily_vol_pct"),
+            "TP %": p.get("profit_barrier_pct"),
+            "SL %": p.get("stop_barrier_pct"),
+            "Conviction": p.get("conviction"),
+            "Calibrated": p.get("calibrated_prob"),
+            "Meta": p.get("meta_decision"),
+            "Horizon": p.get("time_horizon"),
+            "Variant": p.get("strategy_variant", "untagged"),
+        } for p in positions]), use_container_width=True, hide_index=True)
 
-        # Core table — always show
-        fmt_safe = lambda v, fmt: fmt.format(v) if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-"
-        st.dataframe(
-            open_df[["Coin", "Sector", "Direction", "Entry", "Now",
-                      "Unrlzd %", "Unrlzd $", "Invested", "Conviction", "Horizon", "Open Since"]]
-            .style
-            .applymap(color_pnl, subset=["Unrlzd %", "Unrlzd $"])
-            .format({
-                "Entry":      lambda v: fmt_safe(v, "${:,.4f}"),
-                "Now":        lambda v: fmt_safe(v, "${:,.4f}"),
-                "Unrlzd %":   lambda v: fmt_safe(v, "{:+.1f}%"),
-                "Unrlzd $":   lambda v: fmt_safe(v, "${:+.2f}"),
-                "Invested":   lambda v: fmt_safe(v, "${:.2f}"),
-                "Conviction": lambda v: fmt_safe(v, "{:.2f}"),
-            }, na_rep="-"),
-            use_container_width=True,
-            height=400,
-            column_config={"Coin": st.column_config.TextColumn(width="large")},
-            hide_index=True,
-        )
-
-        # Volatility / trailing stop detail table
-        vol_cols = ["Coin", "Vol/day", "Stop×", "Vol Risk", "Trailing Stop", "HWM"]
-        vol_df = open_df[vol_cols].copy()
-        has_vol_data = vol_df["Vol/day"].notna().any()
-        has_trailing = vol_df["Trailing Stop"].notna().any()
-
-        if has_vol_data or has_trailing:
-            st.divider()
-            st.subheader("Risk Detail")
-            st.dataframe(
-                vol_df.style.format({
-                    "Vol/day":      lambda v: f"{v:.1f}%/d" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-                    "Stop×":        lambda v: f"{v:.1f}x"   if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-                    "Trailing Stop":lambda v: f"${v:,.4f}"  if v is not None and not (isinstance(v, float) and pd.isna(v)) else "not active",
-                    "HWM":          lambda v: f"${v:,.4f}"  if v is not None and not (isinstance(v, float) and pd.isna(v)) else "-",
-                }, na_rep="-"),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        # Charts
-        if len(open_df) > 1:
-            st.divider()
-            col_pie, col_bar = st.columns(2)
-
-            with col_pie:
-                st.subheader("Exposure by Coin")
-                fig = px.pie(
-                    open_df, values="Invested", names="Coin", hole=0.4,
-                )
-                fig.update_traces(textposition="inside", textinfo="percent+label")
-                fig.update_layout(showlegend=False, margin=dict(t=20, b=20))
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col_bar:
-                st.subheader("Unrealised P&L by Position")
-                bar_df = open_df[["Coin", "Unrlzd $"]].copy()
-                bar_df = bar_df.sort_values("Unrlzd $")
-                colors = ["#00A86B" if v >= 0 else "#FF6B6B" for v in bar_df["Unrlzd $"]]
-                fig2 = go.Figure(go.Bar(
-                    x=bar_df["Unrlzd $"], y=bar_df["Coin"], orientation="h",
-                    marker_color=colors,
-                ))
-                fig2.update_layout(
-                    margin=dict(l=0, t=20, b=20), yaxis_title="",
-                    xaxis_title="Unrealised P&L ($)",
-                )
-                st.plotly_chart(fig2, use_container_width=True)
-
-        # Sector breakdown
-        if "Sector" in open_df.columns and open_df["Sector"].notna().any():
-            st.divider()
-            st.subheader("Sector Exposure")
-            sector_df = (
-                open_df.groupby("Sector")
-                .agg(Positions=("Invested", "count"), Invested=("Invested", "sum"))
-                .reset_index()
-                .sort_values("Positions", ascending=False)
-            )
-            col_sec_tbl, col_sec_pie = st.columns([1, 2])
-            with col_sec_tbl:
-                st.dataframe(
-                    sector_df.style.format({"Invested": "${:.2f}"}),
-                    hide_index=True, use_container_width=True,
-                )
-            with col_sec_pie:
-                fig_sec = px.pie(sector_df, values="Positions", names="Sector", hole=0.4)
-                fig_sec.update_traces(textposition="inside", textinfo="percent+label")
-                fig_sec.update_layout(showlegend=False, margin=dict(t=10, b=10))
-                st.plotly_chart(fig_sec, use_container_width=True)
+        if any(p.get("sizing_scale_factor") for p in positions):
+            st.subheader("Risk equalisation check")
+            chk = pd.DataFrame([{
+                "symbol": (p.get("symbol") or "?").upper(),
+                "risk (vol × size)": (p.get("sizing_daily_vol_pct") or 0)
+                                     * _amount_invested(p) / 100,
+            } for p in positions])
+            st.plotly_chart(px.bar(chk, x="symbol", y="risk (vol × size)", height=280),
+                            use_container_width=True)
+            st.caption("Bars should be roughly level — that is what vol-targeting buys you.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — CLOSED TRADES
+# RESOLVED
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_resolved:
     if not resolved:
-        st.info("No closed trades found.")
+        st.info("No resolved trades.")
     else:
-        res_df = resolved_trades_df(resolved)
+        censored = sum(1 for t in resolved if t.get("tb_censored"))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Resolved", len(resolved))
+        c2.metric("Uncensored", len(resolved) - censored,
+                  help="Censored = discretionary early exit, not a real barrier outcome.")
+        c3.metric("Realised P&L", f"${sum(t.get('pnl_usd') or 0 for t in resolved):+,.2f}")
+        c4.metric("Censored", censored)
 
-        pnl_known = res_df.dropna(subset=["P&L $"])
-        profitable = pnl_known[pnl_known["P&L $"] > 0]
-        unprofitable = pnl_known[pnl_known["P&L $"] < 0]
-        win_rate = len(profitable) / len(pnl_known) * 100 if len(pnl_known) > 0 else 0
-        total_pnl = res_df["P&L $"].sum()
-        total_invested_r = res_df["Invested"].sum()
+        st.subheader("Exit type breakdown")
+        ex: Dict[str, Dict] = {}
+        for t in resolved:
+            e = ex.setdefault(t.get("close_type", "?"), {"n": 0, "wins": 0, "pnl": 0.0})
+            e["n"] += 1
+            e["wins"] += 1 if (t.get("pnl_pct") or 0) > 0 else 0
+            e["pnl"] += t.get("pnl_usd") or 0
+        st.dataframe(pd.DataFrame([
+            {"Exit": k, "n": v["n"], "Win %": round(100 * v["wins"] / v["n"]),
+             "P&L": round(v["pnl"], 2)} for k, v in ex.items()
+        ]).sort_values("n", ascending=False), use_container_width=True, hide_index=True)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Trades", len(res_df))
-        c2.metric("Wins / Losses", f"{len(profitable)} / {len(unprofitable)}")
-        c3.metric("Win Rate", f"{win_rate:.0f}%")
-        c4.metric("Total P&L", f"${total_pnl:+.2f}")
-        roi = total_pnl / total_invested_r * 100 if total_invested_r > 0 else 0
-        c5.metric("ROI", f"{roi:+.1f}%")
-
-        st.divider()
-
-        # Filters
-        col_f1, col_f2 = st.columns(2)
-        results_r = sorted(res_df["Result"].unique())
-        sel_results_r = col_f1.multiselect("Result", results_r, default=results_r, key="res_result")
-
-        dates = res_df["Date"].dropna()
-        if len(dates) > 0:
-            min_date = pd.to_datetime(dates.min()).date()
-            max_date = pd.to_datetime(dates.max()).date()
-            date_range = col_f2.date_input("Date range", value=(min_date, max_date), key="res_date")
-        else:
-            date_range = None
-
-        mask = res_df["Result"].isin(sel_results_r)
-        if date_range and len(date_range) == 2:
-            mask &= (pd.to_datetime(res_df["Date"]) >= pd.Timestamp(date_range[0])) & \
-                    (pd.to_datetime(res_df["Date"]) <= pd.Timestamp(date_range[1]))
-
-        filtered_r = res_df[mask]
-
-        st.dataframe(
-            style_resolved_df(filtered_r),
-            use_container_width=True,
-            height=420,
-            column_config={"Coin": st.column_config.TextColumn(width="medium")},
-            hide_index=True,
-        )
-
-        # Best / worst
-        st.divider()
-        col_best, col_worst = st.columns(2)
-        sorted_by_pnl = filtered_r.dropna(subset=["P&L $"]).sort_values("P&L $", ascending=False)
-        with col_best:
-            st.subheader("Best Trades")
-            top5 = sorted_by_pnl.head(5)[["Date", "Coin", "P&L $", "P&L %"]]
-            st.dataframe(
-                top5.style.applymap(color_pnl, subset=["P&L $", "P&L %"])
-                .format({"P&L $": "${:+.2f}", "P&L %": "{:+.1f}%"}, na_rep="-"),
-                hide_index=True, use_container_width=True,
-            )
-        with col_worst:
-            st.subheader("Worst Trades")
-            bot5 = sorted_by_pnl.tail(5)[["Date", "Coin", "P&L $", "P&L %"]]
-            st.dataframe(
-                bot5.style.applymap(color_pnl, subset=["P&L $", "P&L %"])
-                .format({"P&L $": "${:+.2f}", "P&L %": "{:+.1f}%"}, na_rep="-"),
-                hide_index=True, use_container_width=True,
-            )
+        st.dataframe(pd.DataFrame([{
+            "Resolved": (t.get("resolved_at") or "")[:16].replace("T", " "),
+            "Symbol": (t.get("symbol") or "?").upper(),
+            "Exit": t.get("close_type"),
+            "TB": {1: "profit", -1: "stop", 0: "neutral"}.get(t.get("tb_label"), "—"),
+            "Censored": "yes" if t.get("tb_censored") else "",
+            "P&L %": t.get("pnl_pct"),
+            "P&L $": t.get("pnl_usd"),
+            "Invested": t.get("amount_invested"),
+            "Conviction": t.get("conviction"),
+            "Screen": t.get("screen_score"),
+            "Variant": t.get("strategy_variant", "untagged"),
+        } for t in sorted(resolved, key=lambda x: x.get("resolved_at", ""), reverse=True)]),
+            use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — P&L ANALYTICS
+# P&L
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_pnl:
     if not resolved:
-        st.info("No closed trades to analyse yet.")
+        st.info("No resolved trades.")
     else:
-        all_time = tracker.all_time_summary()
-        daily = tracker.daily_summary(days=90)
-        monthly = tracker.monthly_summary()
+        running = 0.0
+        cum = []
+        for t in sorted(resolved, key=lambda x: x.get("resolved_at", "")):
+            running += t.get("pnl_usd") or 0
+            cum.append({"resolved_at": (t.get("resolved_at") or "")[:10],
+                        "cumulative": round(running, 2),
+                        "variant": t.get("strategy_variant", "untagged")})
+        cdf = pd.DataFrame(cum)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("All-Time P&L", f"${all_time['total_pnl_usd']:+.2f}")
-        c2.metric("Total Invested", f"${all_time['total_invested']:.2f}")
-        roi_val = all_time['roi_pct']
-        c3.metric("ROI", f"{roi_val:+.1f}%" if roi_val is not None else "-")
-        wr = all_time['win_rate_pct']
-        c4.metric("Win Rate", f"{wr:.0f}%" if wr is not None else "-")
-        c5.metric("Total Trades", f"{all_time['total_trades']}  ({all_time['wins']}W / {all_time['losses']}L)")
-
-        st.divider()
-
-        # Cumulative P&L
         st.subheader("Cumulative P&L")
-        res_df_pnl = resolved_trades_df(resolved).dropna(subset=["P&L $"]).copy()
-        if not res_df_pnl.empty:
-            res_df_pnl["Date"] = pd.to_datetime(res_df_pnl["Date"])
-            res_df_pnl = res_df_pnl.sort_values("Date")
-            res_df_pnl["Cumulative P&L"] = res_df_pnl["P&L $"].cumsum()
-            fig_cum = go.Figure()
-            fig_cum.add_trace(go.Scatter(
-                x=res_df_pnl["Date"], y=res_df_pnl["Cumulative P&L"],
-                mode="lines+markers", fill="tozeroy",
-                line=dict(color="#F7931A", width=2),
-                fillcolor="rgba(247,147,26,0.15)",
-                hovertemplate="<b>%{x|%b %d}</b><br>Cumulative P&L: $%{y:+.2f}<extra></extra>",
-            ))
-            fig_cum.add_hline(y=0, line_dash="dash", line_color="#888", line_width=1)
-            fig_cum.update_layout(height=300, margin=dict(t=10, b=10), xaxis_title="", yaxis_title="P&L ($)")
-            st.plotly_chart(fig_cum, use_container_width=True)
+        if chosen == "All variants" and cdf["variant"].nunique() > 1:
+            fig = px.line(cdf, x="resolved_at", y="cumulative", color="variant", height=380)
+            st.caption("Split by variant — this is the A/B comparison.")
+        else:
+            fig = px.line(cdf, x="resolved_at", y="cumulative", height=380)
+        fig.add_hline(y=0, line_dash="dash", line_color=MUTED)
+        st.plotly_chart(fig, use_container_width=True)
 
-        st.divider()
+        if len(variants_in(resolved)) > 1:
+            st.subheader("Variant comparison")
+            comp = []
+            for v in variants_in(resolved):
+                vt = [t for t in resolved if (t.get("strategy_variant") or "untagged") == v]
+                sc = [t for t in vt
+                      if tb_outcome(t) is not None and t.get("conviction") is not None]
+                p = [float(t["conviction"]) for t in sc]
+                o = [tb_outcome(t) for t in sc]
+                comp.append({
+                    "Variant": v, "Trades": len(vt),
+                    "P&L": round(sum(t.get("pnl_usd") or 0 for t in vt), 2),
+                    "Brier": round(brier_score(p, o), 4) if sc else None,
+                    "Skill": round(skill_score(p, o), 4) if sc else None,
+                })
+            st.dataframe(pd.DataFrame(comp), use_container_width=True, hide_index=True)
 
-        # Daily / Monthly bars
-        col_d, col_m = st.columns(2)
-
-        with col_d:
-            st.subheader("Daily P&L (last 30 days)")
-            daily_df = pd.DataFrame([{"Date": k, **v} for k, v in daily.items()])
-            if not daily_df.empty:
-                daily_df["Date"] = pd.to_datetime(daily_df["Date"])
-                daily_df = daily_df.sort_values("Date")
-                daily_df["Color"] = daily_df["pnl_usd"].apply(lambda x: "#00A86B" if x >= 0 else "#FF6B6B")
-                fig_d = go.Figure(go.Bar(
-                    x=daily_df["Date"], y=daily_df["pnl_usd"], marker_color=daily_df["Color"],
-                    hovertemplate="<b>%{x|%b %d}</b><br>P&L: $%{y:+.2f}<extra></extra>",
-                ))
-                fig_d.add_hline(y=0, line_dash="dash", line_color="#888", line_width=1)
-                fig_d.update_layout(height=280, margin=dict(t=10, b=10), yaxis_title="P&L ($)")
-                st.plotly_chart(fig_d, use_container_width=True)
-
-        with col_m:
-            st.subheader("Monthly P&L")
-            monthly_df = pd.DataFrame([{"Month": k, **v} for k, v in monthly.items()])
-            if not monthly_df.empty:
-                monthly_df = monthly_df.sort_values("Month")
-                monthly_df["Color"] = monthly_df["pnl_usd"].apply(lambda x: "#00A86B" if x >= 0 else "#FF6B6B")
-                fig_m = go.Figure(go.Bar(
-                    x=monthly_df["Month"], y=monthly_df["pnl_usd"], marker_color=monthly_df["Color"],
-                    hovertemplate="<b>%{x}</b><br>P&L: $%{y:+.2f}<extra></extra>",
-                ))
-                fig_m.add_hline(y=0, line_dash="dash", line_color="#888", line_width=1)
-                fig_m.update_layout(height=280, margin=dict(t=10, b=10), yaxis_title="P&L ($)")
-                st.plotly_chart(fig_m, use_container_width=True)
-
-        st.divider()
-
-        # P&L vs Conviction scatter
-        col_conv, col_dist = st.columns(2)
-
-        with col_conv:
-            st.subheader("P&L vs. Conviction")
-            res_df_c = resolved_trades_df(resolved).dropna(subset=["Conviction", "P&L $"])
-            if not res_df_c.empty:
-                fig_conv = px.scatter(
-                    res_df_c, x="Conviction", y="P&L $",
-                    color="Result", color_discrete_map=RESULT_COLORS,
-                    size="Invested",
-                    hover_data=["Coin", "P&L %"],
-                )
-                fig_conv.add_hline(y=0, line_dash="dash", line_color="#888", line_width=1)
-                fig_conv.update_layout(height=280, margin=dict(t=10, b=10))
-                st.plotly_chart(fig_conv, use_container_width=True)
-
-        with col_dist:
-            st.subheader("P&L Distribution")
-            pnl_vals = res_df_pnl["P&L $"].dropna() if not res_df_pnl.empty else pd.Series(dtype=float)
-            if not pnl_vals.empty:
-                fig_hist = px.histogram(
-                    pnl_vals, nbins=20, color_discrete_sequence=["#F7931A"],
-                    labels={"value": "P&L ($)", "count": "# Trades"},
-                )
-                fig_hist.add_vline(x=0, line_dash="dash", line_color="#888")
-                fig_hist.update_layout(height=280, margin=dict(t=10, b=10), showlegend=False)
-                st.plotly_chart(fig_hist, use_container_width=True)
+        st.subheader("P&L by sector")
+        sec: Dict[str, List[float]] = {}
+        for t in resolved:
+            sec.setdefault(t.get("sector", "Other"), []).append(t.get("pnl_usd") or 0)
+        sdf = pd.DataFrame([{"sector": k, "P&L": round(sum(v), 2), "n": len(v)}
+                            for k, v in sec.items()]).sort_values("P&L")
+        st.plotly_chart(px.bar(sdf, x="sector", y="P&L", color="P&L", height=320,
+                               color_continuous_scale=[BAD, MUTED, GOOD]),
+                        use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — LESSONS
+# LESSONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_lessons:
+    st.warning(
+        "**These do not drive behaviour.** Reviewing months of history, the same "
+        "lessons recur near-verbatim while what they warned about kept happening — "
+        "advisory text in a prompt is not a control. The adaptive segment learner "
+        "under *Models & Learning* is the mechanism that actually changes what the "
+        "bot does. Keep these as commentary.", icon="⚠️")
+    lessons = load_lessons()
     if not lessons:
-        st.info("No lessons recorded yet. Lessons are generated after positions are closed.")
+        st.info("No lessons recorded.")
     else:
-        for entry in reversed(lessons[-15:]):
-            date = entry.get("date", "?")
-            wr = entry.get("win_rate_pct")
-            pnl = entry.get("pnl_usd")
-            resolved_count = entry.get("resolved_count", 0)
-
-            wr_str = f"Win rate: {wr}%" if wr is not None else "no data"
-            pnl_str = f"  |  P&L: ${pnl:+.2f}" if pnl is not None else ""
-
-            label = f"{date}  —  {resolved_count} closed  |  {wr_str}{pnl_str}"
-
-            with st.expander(label, expanded=(entry == lessons[-1])):
-                col_w, col_d = st.columns(2)
-
-                with col_w:
-                    what_worked = entry.get("what_worked", [])
-                    if what_worked:
-                        st.markdown("**What worked**")
-                        for item in what_worked:
-                            st.markdown(f"- {item}")
-
-                with col_d:
-                    what_didnt = entry.get("what_didnt_work", [])
-                    if what_didnt:
-                        st.markdown("**What didn't work**")
-                        for item in what_didnt:
-                            st.markdown(f"- {item}")
-
-                lesson_list = entry.get("lessons", [])
-                if lesson_list:
-                    st.markdown("**Lessons for next session**")
-                    for item in lesson_list:
-                        st.markdown(f"- {item}")
-
-                rq = entry.get("reasoning_quality")
-                if rq:
-                    st.caption(f"Reasoning quality: {rq}")
+        for entry in reversed(lessons[-12:]):
+            with st.expander(f"{entry.get('date','?')} — "
+                             f"{entry.get('resolved_count',0)} resolved, "
+                             f"P&L ${entry.get('pnl_usd',0):+.2f}"):
+                for label, key in (("What worked", "what_worked"),
+                                   ("What didn't", "what_didnt_work"),
+                                   ("Lessons", "lessons")):
+                    items = entry.get(key) or []
+                    if items:
+                        st.markdown(f"**{label}**")
+                        for it in items:
+                            st.markdown(f"- {it}")
